@@ -75,3 +75,11 @@ transcript = whisper_result.get("text", "")
 # Combine speaker recognition + transcription
 print(f"Speaker embedding matched neighbors: {query_result.points[0].payload['speaker'] if query_result else 'No matches found'}")
 print("Transcription of the recording:", transcript)
+
+
+#/Users/msahitya14/dev/Minecraft-voice-commands/.venv/lib/python3.13/site-packages/lightning/fabric/utilities/cloud_io.py had to make change at line 76 
+# return torch.load(
+#             f,
+#             map_location=map_location,  # type: ignore[arg-type]
+#             weights_only=False,
+#         )

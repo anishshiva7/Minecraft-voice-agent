@@ -3,4 +3,13 @@ botocore==1.37.11
 pandas==2.2.3
 prettytable==3.16.0
 tqdm==4.62.3
-python-socketio[client] 
+python-socketio[client]
+sounddevice>=0.4.5
+soundfile>=0.12.1
+torch>=2.0.0
+openai-whisper>=20240314
+pynput>=1.7.6
+pyannote.audio>=3.0.0
+qdrant-client>=2.0.0
+python-dotenv>=1.0.0
+keyboard>=0.13.5 

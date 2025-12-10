@@ -15,8 +15,12 @@ from dotenv import load_dotenv
 from typing import Optional, Callable
 import soundfile as sf
 import time
-from pyannote.audio import Pipeline, Inference
+from pyannote.audio import Pipeline, Inference, Model
 from qdrant_client import QdrantClient, models
+
+import time
+
+
 
 load_dotenv()
 
@@ -192,273 +196,122 @@ def prepare_audio_for_pyannote(audio_data, sample_rate):
 
 def transcription_process(command_queue, result_queue, stop_event):
     """
-    Process that handles transcription of audio.
-    Receives audio data from the buffer process and transcribes it using Whisper.
+    Process that handles transcription + speaker identification.
+    Uses Whisper for ASR and pyannote/embedding for speaker ID.
     """
-    print("[Transcription] Starting transcription process...")
-    print("[Transcription] Loading Whisper model...")
-    
-    # Force CPU for Whisper to avoid MPS sparse tensor issues
+
+    print("[Transcription] Starting process...")
+
     device = torch.device("cpu")
-    print(f"[Transcription] Using device: {device}")
-    client = QdrantClient("http://localhost:6333")
-    collection_name = "voicesinmyhead"
+    SAMPLE_RATE = 16000
+    collection_name = "speaker_embeddings"
 
+    # -------------------- Load models --------------------
 
-    
-    try:
-        model = whisper.load_model(WHISPER_MODEL, device=device)
-        print(f"[Transcription] Whisper model ({WHISPER_MODEL}) loaded on {device}")
-        # Load speaker embedding model for direct embedding extraction
+    print("[Transcription] Loading Whisper...")
+    whisper_model = whisper.load_model(WHISPER_MODEL, device=device)
+
+    print("[Speaker] Loading speaker embedding model...")
+    embedding_model = Model.from_pretrained(
+        "pyannote/embedding",
+        token=huggingface,
+    ).to(device)
+
+    embedder = Inference(embedding_model, window="whole")
+
+    print("[Qdrant] Connecting...")
+    qdrant = QdrantClient("http://localhost:6333")
+
+    print("[Transcription] Ready ✅")
+
+    # -------------------- Main loop --------------------
+
+    while not stop_event.is_set():
         try:
-            print("[Transcription] Loading speaker embedding model...")
-            # from pyannote.audio import Inference, Model
-            speaker_embedding_model = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-community-1",
-                token=huggingface,
+            command, audio = command_queue.get(timeout=1.0)
+
+            if command != "transcribe":
+                continue
+
+            # -------------------- Prepare audio --------------------
+
+            if audio.ndim > 1:
+                audio = audio.flatten()
+
+            audio = audio.astype(np.float32)
+
+            # Normalize to [-1, 1] if needed
+            max_val = np.abs(audio).max()
+            if max_val > 0:
+                audio = audio / max_val
+
+            duration = len(audio) / SAMPLE_RATE
+            print(f"[Audio] {duration:.2f}s")
+
+            # -------------------- Transcription --------------------
+
+            result = whisper_model.transcribe(
+                audio,
+                language="en",
+                verbose=False
             )
 
-            # Force pyannote pipeline to CPU to avoid device mismatch between
-            # in-memory waveform (CPU tensor) and model device which can cause
-            # unexpected empty/NaN embeddings on some backends (MPS/CUDA).
-            speaker_device = torch.device("cpu")
-            try:
-                speaker_embedding_model.to(speaker_device)
-                print(f"[Transcription] Speaker embedding model loaded on {speaker_device}")
-            except Exception:
-                # Some Pipeline implementations may not support .to(); ignore if so
-                print("[Transcription] Warning: could not set pipeline device to CPU; proceeding (pipeline may handle device itself)")
+            transcript = result.get("text", "").strip()
+
+            # -------------------- Speaker embedding --------------------
+
+            waveform = torch.from_numpy(audio).unsqueeze(0)  # (1, samples)
+
+            with torch.no_grad():
+                embedding = embedder({
+                    "waveform": waveform,
+                    "sample_rate": SAMPLE_RATE
+                })
+
+            if isinstance(embedding, torch.Tensor):
+                emb = embedding.detach().cpu().numpy().reshape(-1)
+            else:
+                emb = np.asarray(embedding, dtype=np.float32).reshape(-1)
+
+            emb = np.nan_to_num(emb, nan=0.0)
+
+            speaker_name = "Unknown"
+
+            # ic(emb)
+
+            # -------------------- Qdrant lookup --------------------
+
+            if np.linalg.norm(emb) > 1e-6:
+                hits = qdrant.query_points(
+                    collection_name=collection_name,
+                    query=emb.tolist(),
+                    limit=1,
+                )
+
+                if hits and hits.points:
+                    top = hits.points[0]
+                    speaker_name = (
+                        top.payload.get("speaker", "Unknown")
+                        if top.payload else "Unknown"
+                    )
+
+            # -------------------- Output --------------------
+
+            if transcript:
+                print(f"\n{'=' * 50}")
+                print(f"SPEAKER : {speaker_name}")
+                print(f"TEXT    : {transcript}")
+                print(f"{'=' * 50}\n")
+
+            result_queue.put(("transcript", transcript or None, speaker_name))
+
+        except Empty:
+            continue
         except Exception as e:
-            print(f"[Transcription] Could not load speaker embedding model: {e}")
-            import traceback
-            traceback.print_exc()
-            speaker_embedding_model = None
-        
-        while not stop_event.is_set():
-            try:
-                print("[Transcription] Waiting for audio commands...")
-                command_type, audio_data = command_queue.get(timeout=1.0)
-                print(f"[Transcription] Got command from queue: {command_type}")
-                
-                if command_type == "transcribe":
-                    print(f"[Transcription] === STARTING TRANSCRIPTION ===")
-                    print(f"[Transcription] Audio shape: {audio_data.shape}, dtype: {audio_data.dtype}")
-                    print(f"[Transcription] Processing audio ({len(audio_data)} samples, {len(audio_data)/SAMPLE_RATE:.1f}s)...")
-                    
-                    # Flatten if needed (remove channel dimension)
-                    if audio_data.ndim > 1:
-                        print(f"[Transcription] Flattening audio from shape {audio_data.shape}")
-                        audio_data = audio_data.flatten()
-                    
-                    # Keep original audio for speaker embedding (before normalization)
-                    audio_for_speaker = audio_data.copy()
-                    print(f"[Transcription] SAVED audio_for_speaker: shape={audio_for_speaker.shape}, dtype={audio_for_speaker.dtype}, min={audio_for_speaker.min():.4f}, max={audio_for_speaker.max():.4f}")
-                    
-                    # Normalize audio to [-1, 1] range for Whisper
-                    audio_data = audio_data.astype(np.float32)
-                    max_val = np.abs(audio_data).max()
-                    if max_val > 0:
-                        audio_data = audio_data / max_val
-                    
-                    print(f"[Transcription] Normalized audio - min: {audio_data.min():.3f}, max: {audio_data.max():.3f}")
-                    
-                    # Transcribe with language specification for faster processing
-                    try:
-                        print("[Transcription] Calling model.transcribe()...")
-                        result = model.transcribe(audio_data, language="en", verbose=False)
-                        print("[Transcription] Transcription completed!")
-                        transcript = result.get("text", "").strip()
-                        
-                        # Extract speaker embedding using ORIGINAL audio (before Whisper normalization)
-                        speaker_name = "Unknown"
-                        try:
-                            if speaker_embedding_model is None:
-                                print("[Speaker] No speaker embedding model available; skipping speaker identification")
-                                speaker_embedding = None
-                            else:
-                                print(f"[Speaker] Audio for embedding: shape={audio_for_speaker.shape}, dtype={audio_for_speaker.dtype}, min={audio_for_speaker.min():.4f}, max={audio_for_speaker.max():.4f}")
-                                
-                                # Prepare audio_for_speaker for in-memory pipeline call (no temp files)
-                                try:
-                                    af = audio_for_speaker
-                                    # Ensure numpy
-                                    if not isinstance(af, np.ndarray):
-                                        af = np.asarray(af)
+            print(f"[Error] {e}")
+            result_queue.put(("transcript", None, "Unknown"))
 
-                                    # Mono conversion if needed
-                                    if af.ndim == 2:
-                                        # librosa.to_mono expects shape (n_channels, n_samples) when transposed
-                                        try:
-                                            af = librosa.to_mono(af.T)
-                                        except Exception:
-                                            af = af.mean(axis=1)
-
-                                    # Ensure float32 and normalized to [-1, 1]
-                                    if af.dtype.kind != 'f':
-                                        af = af.astype(np.float32)
-                                        # assume int16
-                                        af = af / 32768.0
-                                    else:
-                                        af = af.astype(np.float32)
-                                        if np.abs(af).max() > 1.5:
-                                            # values appear as int-like, normalize
-                                            af = af / 32768.0
-
-                                    # Final check shape -> (channels, samples)
-                                    if af.ndim == 1:
-                                        np_wave = af[np.newaxis, :]
-                                    elif af.ndim == 2:
-                                        # assume (samples, channels) -> transpose
-                                        if af.shape[0] < af.shape[1]:
-                                            np_wave = af.T
-                                        else:
-                                            np_wave = af
-                                    else:
-                                        raise ValueError(f"Unexpected af ndim: {af.ndim}")
-
-                                    # Create tensor (channels, samples), float32, CPU
-                                    waveform = torch.from_numpy(np_wave).float().contiguous().cpu()
-                                    print(f"[Speaker] Prepared waveform tensor: shape={waveform.shape}, dtype={waveform.dtype}, device={waveform.device}")
-
-                                    # Call pipeline with in-memory waveform dict
-                                    print(f"[Speaker] Calling diarization pipeline (in-memory)...")
-                                    diarization = speaker_embedding_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
-                                    print(f"[Speaker] Diarization output type: {type(diarization)}")
-
-                                    # Extract speaker embeddings robustly
-                                    embedding = None
-                                    if hasattr(diarization, 'speaker_embeddings'):
-                                        se = diarization.speaker_embeddings
-                                        try:
-                                            length = len(se)
-                                        except Exception:
-                                            length = 1
-                                        print(f"[Speaker] speaker_embeddings present, length={length}")
-                                        if length > 0:
-                                            embedding = se[0]
-                                    else:
-                                        print("[Speaker] No speaker_embeddings attribute on diarization output. Attributes:", dir(diarization))
-
-                                    # Extract speaker embeddings robustly
-                                    embedding = None
-                                    if hasattr(diarization, 'speaker_embeddings'):
-                                        se = diarization.speaker_embeddings
-                                        try:
-                                            length = len(se)
-                                        except Exception:
-                                            length = 1
-                                        print(f"[Speaker] speaker_embeddings present, length={length}")
-                                        
-                                        # Print diarization timeline for debugging
-                                        try:
-                                            timeline = diarization.get_timeline() if hasattr(diarization, 'get_timeline') else None
-                                            print(f"[Speaker] Diarization timeline: {timeline}")
-                                        except Exception as e:
-                                            print(f"[Speaker] Could not get timeline: {e}")
-                                        
-                                        if length > 0:
-                                            embedding = se[0]
-                                    else:
-                                        print("[Speaker] No speaker_embeddings attribute on diarization output. Attributes:", dir(diarization))
-
-                                    if embedding is not None:
-                                        emb = np.array(embedding, dtype=np.float32).reshape(-1)
-                                        print(f"[Speaker] Embedding shape: {emb.shape}, min={np.nanmin(emb):.6f}, max={np.nanmax(emb):.6f}")
-                                        emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
-                                        print(f"[Speaker] Embedding after nan_to_num: min={np.min(emb):.6f}, max={np.max(emb):.6f}")
-                                        
-                                        # If diarization produced all zeros (no segments detected), fallback to direct embedding extraction
-                                        if np.max(np.abs(emb)) < 1e-6:
-                                            print("[Speaker] Diarization produced zero/NaN embeddings (no segments detected); attempting fallback direct embedding extraction...")
-                                            try:
-                                                from pyannote.audio import Model, Inference
-                                                # Load the embedding extractor model directly
-                                                embedding_model = Model.from_pretrained(
-                                                    "pyannote/embedding",
-                                                    token=huggingface,
-                                                )
-                                                embedding_model = embedding_model.to(torch.device("cpu"))
-                                                inference = Inference(embedding_model, window="whole")
-                                                
-                                                # Extract embedding directly (no diarization segmentation)
-                                                # Inference expects AudioFile; create a minimal dict-like wrapper
-                                                class WaveformFile:
-                                                    def __init__(self, wf, sr):
-                                                        self.waveform = wf
-                                                        self.sample_rate = sr
-                                                
-                                                wav_file = WaveformFile(waveform, SAMPLE_RATE)
-                                                direct_emb = inference(wav_file)
-                                                
-                                                if direct_emb is not None:
-                                                    direct_emb_arr = np.array(direct_emb, dtype=np.float32).reshape(-1)
-                                                    print(f"[Speaker] Fallback direct embedding shape: {direct_emb_arr.shape}, min={np.nanmin(direct_emb_arr):.6f}, max={np.nanmax(direct_emb_arr):.6f}")
-                                                    direct_emb_arr = np.nan_to_num(direct_emb_arr, nan=0.0, posinf=0.0, neginf=0.0)
-                                                    if np.max(np.abs(direct_emb_arr)) > 1e-6:
-                                                        print("[Speaker] Fallback direct embedding is valid; using it")
-                                                        emb = direct_emb_arr
-                                                    else:
-                                                        print("[Speaker] Fallback direct embedding also zero; will use diarization result")
-                                                else:
-                                                    print("[Speaker] Fallback Inference returned None")
-                                            except Exception as fallback_err:
-                                                print(f"[Speaker] Fallback direct embedding extraction failed: {fallback_err}")
-                                                import traceback
-                                                traceback.print_exc()
-                                        
-                                        speaker_embedding = emb.tolist()
-                                    else:
-                                        print("[Speaker] No valid embedding extracted from diarization output")
-                                        speaker_embedding = None
-                                except Exception as pipeline_err:
-                                    print(f"[Speaker] In-memory pipeline/embedding extraction failed: {pipeline_err}")
-                                    import traceback
-                                    traceback.print_exc()
-
-
-                            if speaker_embedding:
-                                vec = speaker_embedding
-                                ic(vec, collection_name)
-                                print(f"[Speaker] Querying Qdrant with vector length {len(vec)}")
-                                search_results = client.query_points(collection_name=collection_name, query=vec, limit=1)
-                                if search_results:
-                                    top = search_results.points[0]
-                                    payload = getattr(top, 'payload', None) or {}
-                                    speaker_name = payload.get('speaker', 'Unknown')
-                                    print(f"[Speaker] Matched: {speaker_name} (score={getattr(top, 'score', None)})")
-                                else:
-                                    print("[Speaker] No matches returned from Qdrant")
-                        except Exception as e:
-                            print(f"[Speaker] Could not query Qdrant or extract embedding: {e}")
-                            import traceback
-                            traceback.print_exc()
-                        
-                        if transcript:
-                            print(f"\n{'='*60}")
-                            print(f"SPEAKER: {speaker_name}")
-                            print(f"TRANSCRIPTION: {transcript}")
-                            print(f"{'='*60}\n")
-                            result_queue.put(("transcript", transcript, speaker_name))
-                        else:
-                            print("[Transcription] No speech detected")
-                            result_queue.put(("transcript", None, speaker_name))
-                            
-                    except Exception as transcribe_error:
-                        print(f"[Transcription] Transcription error: {transcribe_error}")
-                        import traceback
-                        traceback.print_exc()
-                        result_queue.put(("transcript", None, "Unknown"))
-                        
-            except Empty:
-                print("[Transcription] Queue timeout (no commands)")
-                continue
-                
-    except Exception as e:
-        print(f"[Transcription] Error in transcription process: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        print("[Transcription] Transcription process stopped")
+    print("[Transcription] Stopped.")
 
 
 def key_listener_thread(listening_event, stop_event):

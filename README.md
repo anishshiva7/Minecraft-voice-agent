@@ -1,8 +1,10 @@
 Cloned from https://github.com/mindcraft-bots/mindcraft
 
+Install npm packages for MindCraft server:
+```npm install ```
 
 To run the MindCraft server:
-``` node main.js```
+```node main.js```
 
 Ollama models required - Written in andy.json
 ```

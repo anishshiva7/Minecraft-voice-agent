@@ -3,6 +3,25 @@ Cloned from https://github.com/mindcraft-bots/mindcraft
 Install npm packages for MindCraft server:
 ```npm install ```
 
+### To connect to your minecraft server hosted on LAN, change the IP address in settings.js and voice_recognition/settings.py
+
+To start a LAN server in Minecraft:
+* Start a single player game.
+* Once inside the game, press the escape key 'esc'
+* Click on 'Open to LAN'
+* Enter the port number - 55916(can be any port, has to be changed in the settings files as required)
+* Click confirm and it should be visible to other people on the same LAN
+
+
+To join the game from a different computer:
+* Go to multiplayer from the home screen in your game.
+* Click on add server
+* The server address would be the ipadress:port for the machine that started the Minecraft world.
+* Make sure that you are running the same minecraft version as the host.
+
+
+### The steps for the agent to join into your LAN server are given below, after changing the settings
+
 To run the MindCraft server:
 ```node main.js```
 

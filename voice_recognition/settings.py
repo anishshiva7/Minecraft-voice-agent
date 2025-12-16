@@ -8,7 +8,7 @@ import json
 # Mirror of settings.js values
 SETTINGS = {
     "minecraft_version": "auto",
-    "host": "10.8.33.8",
+    "host": "10.8.203.165",
     "port": 55916,
     "auth": "offline",
 

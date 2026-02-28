@@ -86,7 +86,7 @@ Register voices in the database by using the register.py in voice_recognition fo
 
 
 
-The push to talk script might needs sudo access:
+The push to talk script might need sudo access:
 
 ```sudo python3 push_to_talk.py```
 

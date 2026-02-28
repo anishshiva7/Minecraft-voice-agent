@@ -10,7 +10,7 @@ To start a LAN server in Minecraft:
 * Once inside the game, press the escape key 'esc'
 * Click on 'Open to LAN'
 * Enter the port number - 55916(can be any port, has to be changed in the settings files as required)
-* Click confirm and it should be visible to other people on the same LAN
+* Click confirm and it should be visible to other people on the same LAN 
 
 
 To join the game from a different computer:
@@ -86,7 +86,7 @@ Register voices in the database by using the register.py in voice_recognition fo
 
 
 
-The push to talk script might need sudo access:
+The push to talk script might needs sudo access:
 
 ```sudo python3 push_to_talk.py```
 
